@@ -1,0 +1,93 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Check if deploy flag is set
+        id: check_deploy
+        env:
+          DEPLOY_FLAG: ${{ secrets.DEPLOY_FLAG }}
+        run: |
+          if [ "$DEPLOY_FLAG" = "true" ] || [ "$DEPLOY_FLAG" = "1" ]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.check_deploy.outputs.should_deploy == 'true'
+        uses: actions/checkout@v4
+
+      - name: Mask sensitive paths
+        if: steps.check_deploy.outputs.should_deploy == 'true'
+        run: |
+          echo "::add-mask::/opt/dnssh-build"
+          echo "::add-mask::dnssh-server.service"
+
+      - name: Copy source files to Server
+        if: steps.check_deploy.outputs.should_deploy == 'true'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          source: "dnssh.c,makefile,dnssh-server.service"
+          target: "/opt/dnssh-build"
+
+      - name: Deploy and Build on Server
+        if: steps.check_deploy.outputs.should_deploy == 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          script: |
+            # Mute execution logs
+            cd /opt/dnssh-build >/dev/null 2>&1
+            
+            # Install dependencies if missing (Debian/Ubuntu) silently
+            if ! dpkg -s build-essential libsodium-dev zlib1g-dev >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update >/dev/null 2>&1
+              apt-get install -y build-essential libsodium-dev zlib1g-dev >/dev/null 2>&1
+            fi
+            
+            # Build the app silently
+            make clean >/dev/null 2>&1
+            make COMMIT_SHA=$(echo ${{ github.sha }} | cut -c1-7) >/dev/null 2>&1
+            
+            # Move binaries to target location and clean up source
+            TARGET_DIR="${{ secrets.DEPLOY_DIR || '/opt/dnssh' }}"
+            mkdir -p "$TARGET_DIR" >/dev/null 2>&1
+            cp build/dnssh-server "$TARGET_DIR/dnssh-server.new" >/dev/null 2>&1
+            mv "$TARGET_DIR/dnssh-server.new" "$TARGET_DIR/dnssh-server" >/dev/null 2>&1
+            
+            # Setup Systemd Service
+            sed -e "s|/root/dnssh|$TARGET_DIR|g" \
+                -e "s|DEPLOY_PORT|${{ secrets.DEPLOY_PORT || '53' }}|g" \
+                -e "s|DEPLOY_DOMAIN|${{ secrets.DEPLOY_DOMAIN }}|g" \
+                -e "s|DEPLOY_KEY|${{ secrets.DEPLOY_KEY }}|g" \
+                dnssh-server.service > /etc/systemd/system/dnssh-server.service
+            
+            systemctl unmask dnssh-server >/dev/null 2>&1 || true
+            systemctl daemon-reload >/dev/null 2>&1
+            systemctl enable dnssh-server >/dev/null 2>&1
+            systemctl restart dnssh-server >/dev/null 2>&1
+            
+            # Cleanup source
+            cd /opt >/dev/null 2>&1
+            rm -rf /opt/dnssh-build >/dev/null 2>&1

@@ -1,0 +1,12 @@
+[Unit]
+Description=dnssh server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/root/dnssh/dnssh-server DEPLOY_PORT DEPLOY_DOMAIN DEPLOY_KEY
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
