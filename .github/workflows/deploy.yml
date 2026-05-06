@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -24,7 +25,7 @@ jobs:
 
       - name: Checkout code
         if: steps.check_deploy.outputs.should_deploy == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Mask sensitive paths
         if: steps.check_deploy.outputs.should_deploy == 'true'
