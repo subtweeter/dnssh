@@ -49,6 +49,7 @@
 #define RESOLVER_SCAN_ATTEMPTS 2
 #define RESOLVER_SCAN_TIMEOUT_FAST_MS 650
 #define RESOLVER_SCAN_TIMEOUT_SLOW_MS 2200
+#define RESOLVER_FANOUT_PARALLEL 3
 
 static char g_domain[256];
 static uint16_t g_server_port = 53;
@@ -564,6 +565,57 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
     }
 }
 
+static int resolver_fanout_count(int num_resolvers) {
+    if (num_resolvers <= 0) return 0;
+    if (num_resolvers < RESOLVER_FANOUT_PARALLEL) return num_resolvers;
+    return RESOLVER_FANOUT_PARALLEL;
+}
+
+static void send_query_to_fanout(int sock,
+                                 const uint8_t *query,
+                                 size_t qlen,
+                                 const struct sockaddr_in *resolvers,
+                                 int num_resolvers,
+                                 int fanout_base,
+                                 int fanout_count) {
+    int count;
+
+    if (sock < 0 || !query || qlen == 0 || !resolvers || num_resolvers <= 0 || fanout_count <= 0) return;
+
+    count = fanout_count > num_resolvers ? num_resolvers : fanout_count;
+    for (int i = 0; i < count; i++) {
+        int idx = (fanout_base + i) % num_resolvers;
+        sendto(sock, query, qlen, 0, (const struct sockaddr *)&resolvers[idx], sizeof(resolvers[idx]));
+    }
+}
+
+static int send_query_window_rr(int sock,
+                                const uint8_t *query,
+                                size_t qlen,
+                                const struct sockaddr_in *resolvers,
+                                int num_resolvers,
+                                int fanout_base,
+                                int fanout_count,
+                                int *rr_cursor) {
+    int count;
+    int local_cursor;
+    int idx;
+
+    if (sock < 0 || !query || qlen == 0 || !resolvers || num_resolvers <= 0 || fanout_count <= 0) return -1;
+
+    count = fanout_count > num_resolvers ? num_resolvers : fanout_count;
+    local_cursor = (rr_cursor && *rr_cursor >= 0) ? *rr_cursor : 0;
+    idx = (fanout_base + (local_cursor % count)) % num_resolvers;
+
+    sendto(sock, query, qlen, 0, (const struct sockaddr *)&resolvers[idx], sizeof(resolvers[idx]));
+
+    if (rr_cursor) {
+        *rr_cursor = (local_cursor + 1) % count;
+    }
+
+    return idx;
+}
+
     static void hex_encode_bytes(const uint8_t *in, size_t in_len, char *out) {
         static const char hx[] = "0123456789abcdef";
         for (size_t i = 0; i < in_len; i++) {
@@ -927,7 +979,9 @@ int main_client(int argc, char **argv) {
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
     time_t last_heartbeat = 0;
-    int current_res = 0;
+    int fanout_count = resolver_fanout_count(num_res);
+    int fanout_base = 0;
+    int pull_rr_cursor = 0;
     int waiting_for_command_output = 0;
     int saw_output_for_command = 0;
     int empty_polls_after_output = 0;
@@ -944,6 +998,8 @@ int main_client(int argc, char **argv) {
     size_t pending_input_len = 0;
     int should_exit = 0;
     uint8_t buf[4096];
+
+    printf("[DNSSH] Fanout mode: command packets sent to %d resolver(s) in parallel.\n", fanout_count);
 
     printf("[DNSSH] Requesting connection (this may take a few seconds)...\n");
 
@@ -962,7 +1018,7 @@ int main_client(int argc, char **argv) {
         uint8_t query[512];
         size_t qlen = build_dns_query(session_id, (uint8_t *)init_cmd, init_len, query, &id);
         if (qlen > 0) {
-            sendto(sock, query, qlen, 0, (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+            send_query_to_fanout(sock, query, qlen, resolvers, num_res, fanout_base, fanout_count);
             waiting_for_command_output = 1;
             saw_output_for_command = 0;
             empty_polls_after_output = 0;
@@ -1035,8 +1091,7 @@ int main_client(int argc, char **argv) {
                         uint8_t query[512];
                         size_t qlen = build_dns_query(session_id, pending_input, send_len, query, &id);
                         if (qlen > 0) {
-                            sendto(sock, query, qlen, 0,
-                                   (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                            send_query_to_fanout(sock, query, qlen, resolvers, num_res, fanout_base, fanout_count);
                             if (qlen <= sizeof(last_command_query)) {
                                 memcpy(last_command_query, query, qlen);
                                 last_command_query_len = qlen;
@@ -1138,8 +1193,11 @@ int main_client(int argc, char **argv) {
                     uint8_t query[512];
                     size_t qlen = build_dns_query(session_id, dummy, 0, query, &id);
                     if (qlen > 0) {
-                        sendto(sock, query, qlen, 0,
-                               (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                        int sent_idx = send_query_window_rr(sock, query, qlen,
+                                                            resolvers, num_res,
+                                                            fanout_base, fanout_count,
+                                                            &pull_rr_cursor);
+                        (void)sent_idx;
                         gettimeofday(&last_pull, NULL);
                     }
                 } else if (waiting_for_command_output) {
@@ -1174,8 +1232,11 @@ int main_client(int argc, char **argv) {
                 uint8_t query[512];
                 size_t qlen = build_dns_query(session_id, dummy, 0, query, &id);
                 if (qlen > 0) {
-                    sendto(sock, query, qlen, 0,
-                           (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                    int sent_idx = send_query_window_rr(sock, query, qlen,
+                                                        resolvers, num_res,
+                                                        fanout_base, fanout_count,
+                                                        &pull_rr_cursor);
+                    (void)sent_idx;
                     last_pull = now;
                 }
             }
@@ -1185,8 +1246,13 @@ int main_client(int argc, char **argv) {
                 long resend_elapsed_us = (long)((now.tv_sec - last_command_send.tv_sec) * 1000000L +
                                                 (now.tv_usec - last_command_send.tv_usec));
                 if (resend_elapsed_us >= current_resend_interval_us) {
-                    sendto(sock, last_command_query, last_command_query_len, 0,
-                           (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                    send_query_to_fanout(sock,
+                                         last_command_query,
+                                         last_command_query_len,
+                                         resolvers,
+                                         num_res,
+                                         fanout_base,
+                                         fanout_count);
                     last_command_send = now;
                     current_resend_interval_us *= 2;
                     if (current_resend_interval_us > (long)CMD_RESEND_MAX_MS * 1000L) {
@@ -1212,8 +1278,7 @@ int main_client(int argc, char **argv) {
             uint8_t query[512];
             size_t qlen = build_dns_query(session_id, pending_input, send_len, query, &id);
             if (qlen > 0) {
-                sendto(sock, query, qlen, 0,
-                       (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                send_query_to_fanout(sock, query, qlen, resolvers, num_res, fanout_base, fanout_count);
                 if (qlen <= sizeof(last_command_query)) {
                     memcpy(last_command_query, query, qlen);
                     last_command_query_len = qlen;
@@ -1242,14 +1307,17 @@ int main_client(int argc, char **argv) {
             uint8_t query[512];
             size_t qlen = build_dns_query(session_id, dummy, 0, query, &id);  // empty payload = heartbeat
             if (qlen > 0) {
-                sendto(sock, query, qlen, 0,
-                       (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                int sent_idx = send_query_window_rr(sock, query, qlen,
+                                                    resolvers, num_res,
+                                                    fanout_base, fanout_count,
+                                                    &pull_rr_cursor);
+                (void)sent_idx;
             }
             last_heartbeat = time(NULL);
         }
 
-        // resolver rotation on timeout (simple round-robin + backoff)
-        if (waiting_for_command_output || !is_connected || command_inflight) {
+        // Before first connect, shift the fanout window if a resolver group stalls.
+        if (!is_connected) {
             struct timeval now;
             long elapsed_sec;
             long elapsed_since_switch;
@@ -1262,14 +1330,15 @@ int main_client(int argc, char **argv) {
                 break;
             }
 
-            if (num_res > 1 && elapsed_sec >= current_switch_after_sec &&
+            if (num_res > fanout_count && elapsed_sec >= current_switch_after_sec &&
                 elapsed_since_switch >= current_switch_after_sec) {
-                current_res = (current_res + 1) % num_res;
+                fanout_base = (fanout_base + fanout_count) % num_res;
+                pull_rr_cursor = 0;
                 last_resolver_switch = now;
                 {
                     char resolver_text[64];
-                    format_resolver_addr(&resolvers[current_res], resolver_text, sizeof(resolver_text));
-                    printf("[DNSSH] Switched resolver -> %s\r\n", resolver_text);
+                    format_resolver_addr(&resolvers[fanout_base], resolver_text, sizeof(resolver_text));
+                    printf("[DNSSH] Shifted fanout window -> %s (+%d peers)\r\n", resolver_text, fanout_count - 1);
                 }
                 current_switch_after_sec *= 2;
                 if (current_switch_after_sec > RESOLVER_SWITCH_MAX_SEC) {
@@ -1447,7 +1516,10 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
         size_t resp_len = 0;
         const uint8_t *resp_ptr = (const uint8_t *)"";
 
-        if (sess->pty_closed && sess->pending_off >= sess->pending_len) {
+        if (is_replay && decomp_len > 0) {
+            resp_ptr = (const uint8_t *)"";
+            resp_len = 0;
+        } else if (sess->pty_closed && sess->pending_off >= sess->pending_len) {
             resp_ptr = (const uint8_t *)"\xff\xff\xff\xff";
             resp_len = 4;
         } else if (sess->pending_off < sess->pending_len) {
