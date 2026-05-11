@@ -47,8 +47,8 @@
 #define RESOLVER_SWITCH_MAX_SEC 60
 #define CONNECT_TIMEOUT_SEC 75
 #define RESOLVER_SCAN_ATTEMPTS 2
-#define RESOLVER_SCAN_TIMEOUT_FAST_MS 650
-#define RESOLVER_SCAN_TIMEOUT_SLOW_MS 2200
+#define RESOLVER_SCAN_TIMEOUT_FAST_MS 850
+#define RESOLVER_SCAN_TIMEOUT_SLOW_MS 2800
 #define RESOLVER_FANOUT_PARALLEL 3
 
 static char g_domain[256];
@@ -519,6 +519,7 @@ static int scan_and_sort_resolvers(const uint8_t *session_id,
             sent_any = 1;
             sendto(scan_sock, query, qlen, 0,
                    (const struct sockaddr *)&results[i].addr, sizeof(results[i].addr));
+            usleep(500); // Pace UDP sends (500us) to avoid dropping probe packets locally
         }
 
         if (!sent_any) break;
