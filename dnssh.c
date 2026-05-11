@@ -38,6 +38,7 @@
 #define RETRY_BASE_MS 800
 #define MAX_RESOLVERS 10
 #define IO_CHUNK 64
+#define MAX_INPUT_BUFFER 4096
 #define MAX_PENDING_OUT 32768
 #define DNSSH_PROMPT "\x1b[32mdnssh$ \x1b[0m"
 #define CMD_RESEND_MAX_MS 5000
@@ -628,9 +629,12 @@ int main_client(int argc, char **argv) {
     struct timeval last_command_send = {0, 0};
     uint8_t last_command_query[512];
     size_t last_command_query_len = 0;
+    uint16_t last_command_dns_id = 0;
     int command_inflight = 0;
     long current_resend_interval_us = RETRY_BASE_MS * 1000L;
     long current_switch_after_sec = RESOLVER_SWITCH_BASE_SEC;
+    uint8_t pending_input[MAX_INPUT_BUFFER];
+    size_t pending_input_len = 0;
     int should_exit = 0;
     uint8_t buf[4096];
 
@@ -659,6 +663,7 @@ int main_client(int argc, char **argv) {
             if (init_len > 0 && qlen <= sizeof(last_command_query)) {
                 memcpy(last_command_query, query, qlen);
                 last_command_query_len = qlen;
+                last_command_dns_id = id;
                 command_inflight = 1;
                 gettimeofday(&last_command_send, NULL);
                 current_resend_interval_us = RETRY_BASE_MS * 1000L;
@@ -691,12 +696,14 @@ int main_client(int argc, char **argv) {
             if (is_connected && FD_ISSET(STDIN_FILENO, &fds)) {
                 ssize_t n = read(STDIN_FILENO, buf, IO_CHUNK);
                 if (n > 0) {
+                    size_t append_off = 0;
                     for (ssize_t i = 0; i < n; i++) {
                         uint8_t ch = buf[i];
                         if (ch == 0x04) { // Ctrl+D
                             should_exit = 1;
                             break;
                         }
+                        append_off = (size_t)(i + 1);
                     }
 
                     if (should_exit) {
@@ -706,24 +713,42 @@ int main_client(int argc, char **argv) {
                         break;
                     }
 
-                    uint16_t id;
-                    uint8_t query[512];
-                    size_t qlen = build_dns_query(session_id, buf, (size_t)n, query, &id);
-                    if (qlen > 0) {
-                        sendto(sock, query, qlen, 0,
-                               (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
-                        if (qlen <= sizeof(last_command_query)) {
-                            memcpy(last_command_query, query, qlen);
-                            last_command_query_len = qlen;
-                            command_inflight = 1;
-                            gettimeofday(&last_command_send, NULL);
-                            current_resend_interval_us = RETRY_BASE_MS * 1000L;
+                    if (append_off > 0) {
+                        size_t room = sizeof(pending_input) - pending_input_len;
+                        size_t copy_len = append_off > room ? room : append_off;
+                        if (copy_len > 0) {
+                            memcpy(pending_input + pending_input_len, buf, copy_len);
+                            pending_input_len += copy_len;
                         }
-                        waiting_for_command_output = 1;
-                        saw_output_for_command = 0;
-                        empty_polls_after_output = 0;
-                        current_poll_interval_us = 250000L; // Start at 250ms when sending commands
-                        gettimeofday(&last_pull, NULL);
+                    }
+
+                    if (!command_inflight && pending_input_len > 0) {
+                        size_t send_len = pending_input_len > IO_CHUNK ? IO_CHUNK : pending_input_len;
+                        uint16_t id;
+                        uint8_t query[512];
+                        size_t qlen = build_dns_query(session_id, pending_input, send_len, query, &id);
+                        if (qlen > 0) {
+                            sendto(sock, query, qlen, 0,
+                                   (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                            if (qlen <= sizeof(last_command_query)) {
+                                memcpy(last_command_query, query, qlen);
+                                last_command_query_len = qlen;
+                                last_command_dns_id = id;
+                                command_inflight = 1;
+                                gettimeofday(&last_command_send, NULL);
+                                current_resend_interval_us = RETRY_BASE_MS * 1000L;
+                            }
+                            if (pending_input_len > send_len) {
+                                memmove(pending_input, pending_input + send_len, pending_input_len - send_len);
+                            }
+                            pending_input_len -= send_len;
+
+                            waiting_for_command_output = 1;
+                            saw_output_for_command = 0;
+                            empty_polls_after_output = 0;
+                            current_poll_interval_us = 250000L; // Start at 250ms when sending commands
+                            gettimeofday(&last_pull, NULL);
+                        }
                     }
                 }
             }
@@ -739,10 +764,19 @@ int main_client(int argc, char **argv) {
             uint8_t payload[MAX_PAYLOAD * 4];
             size_t plen = 0;
             if (parse_dns_response(buf, r, payload, sizeof(payload), &plen) == 0) {
+                uint16_t resp_id = 0;
+                if ((size_t)r >= 2) {
+                    memcpy(&resp_id, buf, 2);
+                    resp_id = ntohs(resp_id);
+                }
                 gettimeofday(&last_response, NULL);
                 last_resolver_switch = last_response;
                 current_switch_after_sec = RESOLVER_SWITCH_BASE_SEC;
                 current_resend_interval_us = RETRY_BASE_MS * 1000L;
+                if (command_inflight && resp_id == last_command_dns_id) {
+                    command_inflight = 0;
+                    last_command_query_len = 0;
+                }
                 if (plen == 4 && memcmp(payload, "\xff\xff\xff\xff", 4) == 0) {
                     const char *msg = "\r\n[DNSSH] Remote session closed.\r\n";
                     ssize_t mw = write(STDOUT_FILENO, msg, strlen(msg));
@@ -790,7 +824,6 @@ int main_client(int argc, char **argv) {
                 if (plen > 0) {
                     saw_output_for_command = 1;
                     empty_polls_after_output = 0;
-                    command_inflight = 0;
                     current_poll_interval_us = 100000L; // drop interval down to 100ms for fast reading
 
                     uint8_t dummy[1] = {0};
@@ -828,7 +861,7 @@ int main_client(int argc, char **argv) {
             gettimeofday(&now, NULL);
             long elapsed_us = (long)((now.tv_sec - last_pull.tv_sec) * 1000000L +
                                      (now.tv_usec - last_pull.tv_usec));
-            if (elapsed_us >= current_poll_interval_us) {
+            if (!command_inflight && elapsed_us >= current_poll_interval_us) {
                 uint8_t dummy[1] = {0};
                 uint16_t id;
                 uint8_t query[512];
@@ -866,8 +899,37 @@ int main_client(int argc, char **argv) {
             }
         }
 
+        if (is_connected && !command_inflight && pending_input_len > 0) {
+            size_t send_len = pending_input_len > IO_CHUNK ? IO_CHUNK : pending_input_len;
+            uint16_t id;
+            uint8_t query[512];
+            size_t qlen = build_dns_query(session_id, pending_input, send_len, query, &id);
+            if (qlen > 0) {
+                sendto(sock, query, qlen, 0,
+                       (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                if (qlen <= sizeof(last_command_query)) {
+                    memcpy(last_command_query, query, qlen);
+                    last_command_query_len = qlen;
+                    last_command_dns_id = id;
+                    command_inflight = 1;
+                    gettimeofday(&last_command_send, NULL);
+                    current_resend_interval_us = RETRY_BASE_MS * 1000L;
+                }
+                if (pending_input_len > send_len) {
+                    memmove(pending_input, pending_input + send_len, pending_input_len - send_len);
+                }
+                pending_input_len -= send_len;
+
+                waiting_for_command_output = 1;
+                saw_output_for_command = 0;
+                empty_polls_after_output = 0;
+                current_poll_interval_us = 250000L;
+                gettimeofday(&last_pull, NULL);
+            }
+        }
+
         // heartbeat
-        if (time(NULL) - last_heartbeat > HEARTBEAT_SEC) {
+        if (!command_inflight && time(NULL) - last_heartbeat > HEARTBEAT_SEC) {
             uint8_t dummy[1] = {0};
             uint16_t id;
             uint8_t query[512];
