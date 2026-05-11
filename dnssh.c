@@ -460,7 +460,8 @@ static int resolver_scan_cmp(const void *lhs, const void *rhs) {
     return 0;
 }
 
-static int scan_and_sort_resolvers(const struct sockaddr_in *input,
+static int scan_and_sort_resolvers(const uint8_t *session_id,
+                                   const struct sockaddr_in *input,
                                    int input_count,
                                    struct sockaddr_in **out_sorted,
                                    int *out_count) {
@@ -508,10 +509,7 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
 
             if (results[i].valid) continue;
 
-            uint8_t temp_session_id[SESSION_ID_LEN];
-            randombytes_buf(temp_session_id, SESSION_ID_LEN);
-
-            qlen = build_dns_query(temp_session_id, dummy_payload, 0, query, &generated_id);
+            qlen = build_dns_query(session_id, dummy_payload, 0, query, &generated_id);
             if (qlen == 0) continue;
 
             tx_ids[i] = generated_id;
@@ -1047,12 +1045,15 @@ int main_client(int argc, char **argv) {
         return 1;
     }
 
+    uint8_t session_id[SESSION_ID_LEN];
+    randombytes_buf(session_id, SESSION_ID_LEN);
+
     printf("[DNSSH] Scanning %d resolver(s) for reachability...\n", num_res);
     {
         struct sockaddr_in *validated = NULL;
         int validated_count = 0;
 
-        if (scan_and_sort_resolvers(input_resolvers, num_res, &validated, &validated_count) != 0) {
+        if (scan_and_sort_resolvers(session_id, input_resolvers, num_res, &validated, &validated_count) != 0) {
             fprintf(stderr, "[DNSSH] Resolver scan failed due to internal error.\n");
             free(input_resolvers);
             return 1;
@@ -1079,9 +1080,6 @@ int main_client(int argc, char **argv) {
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(sock, F_SETFL, O_NONBLOCK);
-
-    uint8_t session_id[SESSION_ID_LEN];
-    randombytes_buf(session_id, SESSION_ID_LEN);
 
     printf("[DNSSH] Client started (Build: %s) - Session ID: ", COMMIT_SHA);
     for (int i = 0; i < SESSION_ID_LEN; i++) printf("%02x", session_id[i]);
