@@ -311,6 +311,89 @@ static int resolver_addr_equal(const struct sockaddr_in *a, const struct sockadd
            a->sin_addr.s_addr == b->sin_addr.s_addr;
 }
 
+static char *trim_line_inplace(char *s) {
+    char *start;
+    char *end;
+
+    if (!s) return s;
+
+    start = s;
+    while (*start && isspace((unsigned char)*start)) start++;
+
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    *end = '\0';
+
+    return start;
+}
+
+static int add_resolver_unique(struct sockaddr_in *dst,
+                               int *inout_count,
+                               int dst_cap,
+                               const struct sockaddr_in *candidate) {
+    if (!dst || !inout_count || !candidate || dst_cap <= 0) return -1;
+
+    for (int i = 0; i < *inout_count; i++) {
+        if (resolver_addr_equal(&dst[i], candidate)) {
+            return 0;
+        }
+    }
+
+    if (*inout_count >= dst_cap) return -1;
+
+    dst[*inout_count] = *candidate;
+    (*inout_count)++;
+    return 1;
+}
+
+static int load_resolvers_from_file(const char *path,
+                                    struct sockaddr_in *dst,
+                                    int *inout_count,
+                                    int dst_cap) {
+    FILE *f;
+    char line[256];
+    int line_no = 0;
+
+    if (!path || !*path || !dst || !inout_count || dst_cap <= 0) return -1;
+
+    f = fopen(path, "r");
+    if (!f) {
+        perror("[DNSSH] Failed to open resolver file");
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        char *entry;
+        struct sockaddr_in parsed;
+
+        line_no++;
+
+        if (!strchr(line, '\n') && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != '\n' && c != EOF) {}
+            fprintf(stderr, "[DNSSH] Resolver file line too long at %s:%d\n", path, line_no);
+            fclose(f);
+            return -1;
+        }
+
+        entry = trim_line_inplace(line);
+        if (*entry == '\0' || *entry == '#' || *entry == ';') continue;
+
+        if (parse_resolver_arg(entry, &parsed) != 0) {
+            fprintf(stderr, "[DNSSH] Invalid resolver in %s:%d -> %s\n", path, line_no, entry);
+            fclose(f);
+            return -1;
+        }
+
+        if (add_resolver_unique(dst, inout_count, dst_cap, &parsed) < 0) {
+            break;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
 static long timeval_diff_ms(const struct timeval *start, const struct timeval *end) {
     long sec;
     long usec;
@@ -904,7 +987,7 @@ static int parse_dns_response(const uint8_t *packet, size_t len, uint8_t *out_pa
 // ====================== CLIENT ======================
 int main_client(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <domain> <key_hex_64> <resolver1> [resolver2] ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s <domain> <key_hex_64> <resolver_or_@file> [resolver_or_@file] ...\n", argv[0]);
         return 1;
     }
 
@@ -922,26 +1005,38 @@ int main_client(int argc, char **argv) {
     struct sockaddr_in resolvers[MAX_RESOLVERS];
     int arg_resolvers = argc - 3;
     int num_res = 0;
-    if (arg_resolvers > MAX_RESOLVERS) arg_resolvers = MAX_RESOLVERS;
 
     for (int i = 0; i < arg_resolvers; i++) {
-        struct sockaddr_in parsed;
-        int is_duplicate = 0;
+        const char *arg = argv[i + 3];
+        const char *file_path = arg;
+        int should_load_file = 0;
 
-        if (parse_resolver_arg(argv[i + 3], &parsed) != 0) {
-            fprintf(stderr, "Invalid resolver (expected ip or ip:port): %s\n", argv[i + 3]);
+        if (num_res >= MAX_RESOLVERS) break;
+
+        if (arg[0] == '@') {
+            if (arg[1] == '\0') {
+                fprintf(stderr, "Invalid resolver file argument: @\n");
+                return 1;
+            }
+            should_load_file = 1;
+            file_path = arg + 1;
+        }
+
+        if (should_load_file) {
+            int before = num_res;
+            if (load_resolvers_from_file(file_path, input_resolvers, &num_res, MAX_RESOLVERS) != 0) {
+                return 1;
+            }
+            printf("[DNSSH] Loaded %d resolver(s) from file: %s\n", num_res - before, file_path);
+            continue;
+        }
+
+        struct sockaddr_in parsed;
+        if (parse_resolver_arg(arg, &parsed) != 0) {
+            fprintf(stderr, "Invalid resolver (expected ip, ip:port, or @file): %s\n", arg);
             return 1;
         }
-
-        for (int j = 0; j < num_res; j++) {
-            if (resolver_addr_equal(&input_resolvers[j], &parsed)) {
-                is_duplicate = 1;
-                break;
-            }
-        }
-        if (is_duplicate) continue;
-
-        input_resolvers[num_res++] = parsed;
+        (void)add_resolver_unique(input_resolvers, &num_res, MAX_RESOLVERS, &parsed);
     }
 
     if (num_res <= 0) {
