@@ -40,8 +40,11 @@
 #define IO_CHUNK 64
 #define MAX_PENDING_OUT 32768
 #define DNSSH_PROMPT "\x1b[32mdnssh$ \x1b[0m"
-#define RESOLVER_SWITCH_SEC 5
-#define CONNECT_TIMEOUT_SEC 20
+#define CMD_RESEND_MAX_MS 5000
+#define COMMAND_STALL_SEC 90
+#define RESOLVER_SWITCH_BASE_SEC 12
+#define RESOLVER_SWITCH_MAX_SEC 60
+#define CONNECT_TIMEOUT_SEC 75
 
 static char g_domain[256];
 static uint16_t g_server_port = 53;
@@ -622,6 +625,12 @@ int main_client(int argc, char **argv) {
     int empty_polls_after_output = 0;
     long current_poll_interval_us = 250000L;
     struct timeval last_pull = {0, 0};
+    struct timeval last_command_send = {0, 0};
+    uint8_t last_command_query[512];
+    size_t last_command_query_len = 0;
+    int command_inflight = 0;
+    long current_resend_interval_us = RETRY_BASE_MS * 1000L;
+    long current_switch_after_sec = RESOLVER_SWITCH_BASE_SEC;
     int should_exit = 0;
     uint8_t buf[4096];
 
@@ -647,6 +656,16 @@ int main_client(int argc, char **argv) {
             saw_output_for_command = 0;
             empty_polls_after_output = 0;
             gettimeofday(&last_pull, NULL);
+            if (init_len > 0 && qlen <= sizeof(last_command_query)) {
+                memcpy(last_command_query, query, qlen);
+                last_command_query_len = qlen;
+                command_inflight = 1;
+                gettimeofday(&last_command_send, NULL);
+                current_resend_interval_us = RETRY_BASE_MS * 1000L;
+            } else {
+                command_inflight = 0;
+                last_command_query_len = 0;
+            }
         }
     }
 
@@ -656,6 +675,7 @@ int main_client(int argc, char **argv) {
     int is_connected = 0;
     struct timeval last_response;
     gettimeofday(&last_response, NULL);
+    struct timeval last_resolver_switch = last_response;
     
     while (1) {
         fd_set fds;
@@ -692,6 +712,13 @@ int main_client(int argc, char **argv) {
                     if (qlen > 0) {
                         sendto(sock, query, qlen, 0,
                                (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                        if (qlen <= sizeof(last_command_query)) {
+                            memcpy(last_command_query, query, qlen);
+                            last_command_query_len = qlen;
+                            command_inflight = 1;
+                            gettimeofday(&last_command_send, NULL);
+                            current_resend_interval_us = RETRY_BASE_MS * 1000L;
+                        }
                         waiting_for_command_output = 1;
                         saw_output_for_command = 0;
                         empty_polls_after_output = 0;
@@ -713,6 +740,9 @@ int main_client(int argc, char **argv) {
             size_t plen = 0;
             if (parse_dns_response(buf, r, payload, sizeof(payload), &plen) == 0) {
                 gettimeofday(&last_response, NULL);
+                last_resolver_switch = last_response;
+                current_switch_after_sec = RESOLVER_SWITCH_BASE_SEC;
+                current_resend_interval_us = RETRY_BASE_MS * 1000L;
                 if (plen == 4 && memcmp(payload, "\xff\xff\xff\xff", 4) == 0) {
                     const char *msg = "\r\n[DNSSH] Remote session closed.\r\n";
                     ssize_t mw = write(STDOUT_FILENO, msg, strlen(msg));
@@ -760,6 +790,7 @@ int main_client(int argc, char **argv) {
                 if (plen > 0) {
                     saw_output_for_command = 1;
                     empty_polls_after_output = 0;
+                    command_inflight = 0;
                     current_poll_interval_us = 100000L; // drop interval down to 100ms for fast reading
 
                     uint8_t dummy[1] = {0};
@@ -783,6 +814,8 @@ int main_client(int argc, char **argv) {
                             waiting_for_command_output = 0;
                             saw_output_for_command = 0;
                             empty_polls_after_output = 0;
+                            command_inflight = 0;
+                            last_command_query_len = 0;
                         }
                     }
                 }
@@ -806,6 +839,31 @@ int main_client(int argc, char **argv) {
                     last_pull = now;
                 }
             }
+
+            // Retransmit the latest non-empty command packet if no response arrives.
+            if (command_inflight && last_command_query_len > 0) {
+                long resend_elapsed_us = (long)((now.tv_sec - last_command_send.tv_sec) * 1000000L +
+                                                (now.tv_usec - last_command_send.tv_usec));
+                if (resend_elapsed_us >= current_resend_interval_us) {
+                    sendto(sock, last_command_query, last_command_query_len, 0,
+                           (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
+                    last_command_send = now;
+                    current_resend_interval_us *= 2;
+                    if (current_resend_interval_us > (long)CMD_RESEND_MAX_MS * 1000L) {
+                        current_resend_interval_us = (long)CMD_RESEND_MAX_MS * 1000L;
+                    }
+                }
+            }
+
+            if ((now.tv_sec - last_response.tv_sec) >= COMMAND_STALL_SEC) {
+                waiting_for_command_output = 0;
+                saw_output_for_command = 0;
+                empty_polls_after_output = 0;
+                command_inflight = 0;
+                last_command_query_len = 0;
+                current_poll_interval_us = 250000L;
+                current_resend_interval_us = RETRY_BASE_MS * 1000L;
+            }
         }
 
         // heartbeat
@@ -822,21 +880,28 @@ int main_client(int argc, char **argv) {
         }
 
         // resolver rotation on timeout (simple round-robin + backoff)
-        if (waiting_for_command_output || !is_connected) {
+        if (waiting_for_command_output || !is_connected || command_inflight) {
             struct timeval now;
             long elapsed_sec;
+            long elapsed_since_switch;
             gettimeofday(&now, NULL);
             elapsed_sec = (long)(now.tv_sec - last_response.tv_sec);
+            elapsed_since_switch = (long)(now.tv_sec - last_resolver_switch.tv_sec);
 
             if (!is_connected && elapsed_sec >= CONNECT_TIMEOUT_SEC) {
                 printf("\r\n[DNSSH] Timed out waiting for server. Aborting connection.\r\n");
                 break;
             }
 
-            if (num_res > 1 && elapsed_sec >= RESOLVER_SWITCH_SEC) {
+            if (num_res > 1 && elapsed_sec >= current_switch_after_sec &&
+                elapsed_since_switch >= current_switch_after_sec) {
                 current_res = (current_res + 1) % num_res;
-                last_response = now;
-                printf("[DNSSH] Switched resolver → %s\r\n", inet_ntoa(resolvers[current_res].sin_addr));
+                last_resolver_switch = now;
+                printf("[DNSSH] Switched resolver -> %s\r\n", inet_ntoa(resolvers[current_res].sin_addr));
+                current_switch_after_sec *= 2;
+                if (current_switch_after_sec > RESOLVER_SWITCH_MAX_SEC) {
+                    current_switch_after_sec = RESOLVER_SWITCH_MAX_SEC;
+                }
             }
         }
     }
@@ -923,6 +988,7 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
 
     // --- Session / Replay Tracking ---
     int s_idx = -1;
+    int is_replay = 0;
     time_t now = time(NULL);
     
     // Find existing session
@@ -937,9 +1003,11 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
         // Replay check
         if (decomp_len > 0) {
             if (hdr->seq <= g_sessions[s_idx].last_seq) {
-                free(plain); free(decomp); return; // Drop replay
+                // Do not execute duplicate command payloads, but still reply below.
+                is_replay = 1;
+            } else {
+                g_sessions[s_idx].last_seq = hdr->seq;
             }
-            g_sessions[s_idx].last_seq = hdr->seq;
         }
         g_sessions[s_idx].last_active = now;
     } else {
@@ -986,7 +1054,7 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
         }
     }
 
-    if (decomp_len > 0 && sess->pty_fd >= 0) {
+    if (decomp_len > 0 && sess->pty_fd >= 0 && !is_replay) {
         ssize_t w = write(sess->pty_fd, decomp, decomp_len);
         (void)w;
         // Optimization: Let the PTY produce some output immediately
