@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build for ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            docker_arch: amd64
+          - arch: aarch64
+            docker_arch: aarch64
+          - arch: armv7
+            docker_arch: armv7
+          - arch: armv6
+            docker_arch: armv6
+          - arch: i386
+            docker_arch: i386
+          - arch: s390x
+            docker_arch: s390x
+          - arch: ppc64le
+            docker_arch: ppc64le
+          - arch: riscv64
+            docker_arch: riscv64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        uses: uraimo/run-on-arch-action@v3
+        with:
+          arch: ${{ matrix.docker_arch }}
+          distro: alpine_latest
+          githubToken: ${{ github.token }}
+          install: |
+            apk add --no-cache build-base libsodium-dev zlib-dev libsodium-static zlib-static git musl-dev linux-headers
+          run: |
+            make clean
+            make CC=gcc COMMIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo ${{ github.sha }} | cut -c1-7)
+            mv build/dnssh dnssh-${{ matrix.arch }}
+            mv build/dnssh-server dnssh-server-${{ matrix.arch }}
+
+      - name: Upload dnssh artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnssh-${{ matrix.arch }}
+          path: dnssh-${{ matrix.arch }}
+
+      - name: Upload dnssh-server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnssh-server-${{ matrix.arch }}
+          path: dnssh-server-${{ matrix.arch }}
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Main Build
+          prerelease: true
+          files: |
+            dnssh-${{ matrix.arch }}
+            dnssh-server-${{ matrix.arch }}
