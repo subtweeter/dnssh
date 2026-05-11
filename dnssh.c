@@ -65,7 +65,8 @@ typedef struct __attribute__((packed)) {
 // Session Tracking for Replay Protection and Output Separation
 typedef struct {
     uint8_t session_id[SESSION_ID_LEN];
-    uint32_t last_seq;
+    uint32_t seq_cache[32];
+    int seq_cache_idx;
     time_t last_active;
     uint8_t pending_out[MAX_PENDING_OUT];
     size_t pending_len;
@@ -1110,8 +1111,9 @@ int main_client(int argc, char **argv) {
     size_t pending_input_len = 0;
     int should_exit = 0;
     uint8_t buf[4096];
-    uint32_t last_rx_seq = 0;
-    int first_rx = 1;
+    uint32_t rx_seq_cache[32];
+    for (int i = 0; i < 32; i++) rx_seq_cache[i] = 0xFFFFFFFF;
+    int rx_seq_idx = 0;
 
     printf("[DNSSH] Fanout mode: command packets sent to %d resolver(s) in parallel.\n", fanout_count);
 
@@ -1241,11 +1243,16 @@ int main_client(int argc, char **argv) {
             size_t plen = 0;
             uint32_t rx_seq = 0;
             if (parse_dns_response(buf, r, payload, sizeof(payload), &plen, &rx_seq) == 0) {
-                if (!first_rx && rx_seq <= last_rx_seq) {
-                    continue; // Skip cached duplicate packets received from parallel fanout resolvers
+                int is_dup = 0;
+                for (int i = 0; i < 32; i++) {
+                    if (rx_seq_cache[i] == rx_seq) {
+                        is_dup = 1;
+                        break;
+                    }
                 }
-                first_rx = 0;
-                last_rx_seq = rx_seq;
+                if (is_dup) continue;
+                rx_seq_cache[rx_seq_idx] = rx_seq;
+                rx_seq_idx = (rx_seq_idx + 1) % 32;
 
                 uint16_t resp_id = 0;
                 if ((size_t)r >= 2) {
@@ -1567,11 +1574,16 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
     if (s_idx >= 0) {
         // Replay check
         if (decomp_len > 0) {
-            if (hdr->seq <= g_sessions[s_idx].last_seq) {
-                // Do not execute duplicate command payloads, but still reply below.
-                is_replay = 1;
-            } else {
-                g_sessions[s_idx].last_seq = hdr->seq;
+            is_replay = 0;
+            for (int i = 0; i < 32; i++) {
+                if (g_sessions[s_idx].seq_cache[i] == hdr->seq) {
+                    is_replay = 1;
+                    break;
+                }
+            }
+            if (!is_replay) {
+                g_sessions[s_idx].seq_cache[g_sessions[s_idx].seq_cache_idx] = hdr->seq;
+                g_sessions[s_idx].seq_cache_idx = (g_sessions[s_idx].seq_cache_idx + 1) % 32;
             }
         }
         g_sessions[s_idx].last_active = now;
@@ -1594,7 +1606,9 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
 
         g_sessions[s_idx].active = 1;
         memcpy(g_sessions[s_idx].session_id, hdr->session_id, SESSION_ID_LEN);
-        g_sessions[s_idx].last_seq = hdr->seq;
+        for (int i = 0; i < 32; i++) g_sessions[s_idx].seq_cache[i] = 0xFFFFFFFF;
+        g_sessions[s_idx].seq_cache[0] = hdr->seq;
+        g_sessions[s_idx].seq_cache_idx = 1;
         g_sessions[s_idx].last_active = now;
         g_sessions[s_idx].pending_len = 0;
         g_sessions[s_idx].pending_off = 0;
