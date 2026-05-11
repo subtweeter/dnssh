@@ -81,7 +81,6 @@ jobs:
         with:
           arch: ${{ matrix.docker_arch }}
           distro: alpine_latest
-          githubToken: ${{ github.token }}
           install: |
             apk add --no-cache build-base libsodium-dev zlib-dev libsodium-static zlib-static git musl-dev linux-headers
           run: |
