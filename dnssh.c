@@ -49,7 +49,7 @@
 #define RESOLVER_SCAN_ATTEMPTS 2
 #define RESOLVER_SCAN_TIMEOUT_FAST_MS 850
 #define RESOLVER_SCAN_TIMEOUT_SLOW_MS 2800
-#define RESOLVER_FANOUT_PARALLEL 5
+#define RESOLVER_FANOUT_PARALLEL 10
 
 static char g_domain[256];
 static uint16_t g_server_port = 53;
@@ -81,7 +81,7 @@ static dnssh_session_t g_sessions[MAX_SESSIONS];
 
 // Forward declarations
 static size_t build_dns_query(const uint8_t *session_id, const uint8_t *payload, size_t pay_len, uint8_t *packet, uint16_t *out_id);
-static int parse_dns_response(const uint8_t *packet, size_t len, uint8_t *out_payload, size_t out_cap, size_t *out_len);
+static int parse_dns_response(const uint8_t *packet, size_t len, uint8_t *out_payload, size_t out_cap, size_t *out_len, uint32_t *out_seq);
 
 // ====================== SHARED HELPERS ======================
 static uint8_t shared_key[KEY_LEN];   // pre-shared for v0.1 (load from file in prod)
@@ -566,6 +566,7 @@ static int scan_and_sort_resolvers(const uint8_t *session_id,
                 uint16_t resp_flags;
                 uint8_t dummy_out[MAX_PAYLOAD * 4];
                 size_t dummy_out_len = 0;
+                uint32_t dummy_rx_seq = 0;
                 memcpy(&resp_id, resp, 2);
                 memcpy(&resp_flags, resp + 2, 2);
                 resp_id = ntohs(resp_id);
@@ -573,7 +574,7 @@ static int scan_and_sort_resolvers(const uint8_t *session_id,
                 if (!(resp_flags & 0x8000)) continue;
                 if ((resp_flags & 0x000F) != 0) continue; // NOERROR
                 
-                if (parse_dns_response(resp, rn, dummy_out, sizeof(dummy_out), &dummy_out_len) != 0) continue;
+                if (parse_dns_response(resp, rn, dummy_out, sizeof(dummy_out), &dummy_out_len, &dummy_rx_seq) != 0) continue;
 
                 for (int i = 0; i < input_count; i++) {
                     long rtt_ms;
@@ -893,7 +894,7 @@ static size_t build_dns_txt_response(const uint8_t *session_id, const uint8_t *q
     return p;
 }
 
-static int parse_dns_response(const uint8_t *packet, size_t len, uint8_t *out_payload, size_t out_cap, size_t *out_len) {
+static int parse_dns_response(const uint8_t *packet, size_t len, uint8_t *out_payload, size_t out_cap, size_t *out_len, uint32_t *out_seq) {
     if (len < 12) return -1;
     uint16_t id, flags, ancount;
     memcpy(&id, packet, 2);
@@ -969,6 +970,7 @@ static int parse_dns_response(const uint8_t *packet, size_t len, uint8_t *out_pa
                 }
                 memcpy(out_payload, decomp, outsize);
                 *out_len = outsize;
+                if (out_seq) *out_seq = hdr->seq;
                 free(plain); free(decomp);
                 return 0;
             }
@@ -1108,6 +1110,8 @@ int main_client(int argc, char **argv) {
     size_t pending_input_len = 0;
     int should_exit = 0;
     uint8_t buf[4096];
+    uint32_t last_rx_seq = 0;
+    int first_rx = 1;
 
     printf("[DNSSH] Fanout mode: command packets sent to %d resolver(s) in parallel.\n", fanout_count);
 
@@ -1235,7 +1239,14 @@ int main_client(int argc, char **argv) {
         if (r > 0) {
             uint8_t payload[MAX_PAYLOAD * 4];
             size_t plen = 0;
-            if (parse_dns_response(buf, r, payload, sizeof(payload), &plen) == 0) {
+            uint32_t rx_seq = 0;
+            if (parse_dns_response(buf, r, payload, sizeof(payload), &plen, &rx_seq) == 0) {
+                if (!first_rx && rx_seq <= last_rx_seq) {
+                    continue; // Skip cached duplicate packets received from parallel fanout resolvers
+                }
+                first_rx = 0;
+                last_rx_seq = rx_seq;
+
                 uint16_t resp_id = 0;
                 if ((size_t)r >= 2) {
                     memcpy(&resp_id, buf, 2);
