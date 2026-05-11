@@ -1573,19 +1573,18 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
     
     if (s_idx >= 0) {
         // Replay check
-        if (decomp_len > 0) {
-            is_replay = 0;
-            for (int i = 0; i < 32; i++) {
-                if (g_sessions[s_idx].seq_cache[i] == hdr->seq) {
-                    is_replay = 1;
-                    break;
-                }
-            }
-            if (!is_replay) {
-                g_sessions[s_idx].seq_cache[g_sessions[s_idx].seq_cache_idx] = hdr->seq;
-                g_sessions[s_idx].seq_cache_idx = (g_sessions[s_idx].seq_cache_idx + 1) % 32;
+        is_replay = 0;
+        for (int i = 0; i < 32; i++) {
+            if (g_sessions[s_idx].seq_cache[i] == hdr->seq) {
+                is_replay = 1;
+                break;
             }
         }
+        if (!is_replay) {
+            g_sessions[s_idx].seq_cache[g_sessions[s_idx].seq_cache_idx] = hdr->seq;
+            g_sessions[s_idx].seq_cache_idx = (g_sessions[s_idx].seq_cache_idx + 1) % 32;
+        }
+
         g_sessions[s_idx].last_active = now;
     } else {
         // Allocate new session
