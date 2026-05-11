@@ -34,22 +34,22 @@
 #define NONCE_LEN crypto_secretbox_NONCEBYTES
 #define KEY_LEN crypto_secretbox_KEYBYTES
 #define MAX_LABEL 63
-#define HEARTBEAT_SEC 45
-#define RETRY_BASE_MS 800
+#define HEARTBEAT_SEC 25
+#define RETRY_BASE_MS 350
 #define MAX_RESOLVERS 10
 #define IO_CHUNK 64
 #define MAX_INPUT_BUFFER 4096
 #define MAX_PENDING_OUT 32768
 #define DNSSH_PROMPT "\x1b[32mdnssh$ \x1b[0m"
-#define CMD_RESEND_MAX_MS 5000
+#define CMD_RESEND_MAX_MS 1500
 #define COMMAND_STALL_SEC 90
-#define RESOLVER_SWITCH_BASE_SEC 12
-#define RESOLVER_SWITCH_MAX_SEC 60
-#define CONNECT_TIMEOUT_SEC 75
+#define RESOLVER_SWITCH_BASE_SEC 8
+#define RESOLVER_SWITCH_MAX_SEC 35
+#define CONNECT_TIMEOUT_SEC 45
 #define RESOLVER_SCAN_ATTEMPTS 2
 #define RESOLVER_SCAN_TIMEOUT_FAST_MS 850
 #define RESOLVER_SCAN_TIMEOUT_SLOW_MS 2800
-#define RESOLVER_FANOUT_PARALLEL 3
+#define RESOLVER_FANOUT_PARALLEL 5
 
 static char g_domain[256];
 static uint16_t g_server_port = 53;
@@ -1095,7 +1095,7 @@ int main_client(int argc, char **argv) {
     int waiting_for_command_output = 0;
     int saw_output_for_command = 0;
     int empty_polls_after_output = 0;
-    long current_poll_interval_us = 250000L;
+    long current_poll_interval_us = 150000L;
     struct timeval last_pull = {0, 0};
     struct timeval last_command_send = {0, 0};
     uint8_t last_command_query[512];
@@ -1218,7 +1218,7 @@ int main_client(int argc, char **argv) {
                             waiting_for_command_output = 1;
                             saw_output_for_command = 0;
                             empty_polls_after_output = 0;
-                            current_poll_interval_us = 250000L; // Start at 250ms when sending commands
+                            current_poll_interval_us = 100000L; // Start aggressive when sending commands
                             gettimeofday(&last_pull, NULL);
                         }
                     }
@@ -1315,8 +1315,8 @@ int main_client(int argc, char **argv) {
                         empty_polls_after_output++;
                         
                         // Dynamically increase poll interval up to ~2 seconds if idle
-                        current_poll_interval_us = current_poll_interval_us * 2;
-                        if (current_poll_interval_us > 2000000L) current_poll_interval_us = 2000000L;
+                        current_poll_interval_us = current_poll_interval_us + 50000L;
+                        if (current_poll_interval_us > 1500000L) current_poll_interval_us = 1500000L;
 
                         if (empty_polls_after_output >= 20) { // Timeout after ~15-20 seconds of no output
                             waiting_for_command_output = 0;
@@ -1377,7 +1377,7 @@ int main_client(int argc, char **argv) {
                 empty_polls_after_output = 0;
                 command_inflight = 0;
                 last_command_query_len = 0;
-                current_poll_interval_us = 250000L;
+                current_poll_interval_us = 200000L;
                 current_resend_interval_us = RETRY_BASE_MS * 1000L;
             }
         }
@@ -1405,7 +1405,7 @@ int main_client(int argc, char **argv) {
                 waiting_for_command_output = 1;
                 saw_output_for_command = 0;
                 empty_polls_after_output = 0;
-                current_poll_interval_us = 250000L;
+                current_poll_interval_us = 100000L;
                 gettimeofday(&last_pull, NULL);
             }
         }
@@ -1613,7 +1613,7 @@ static void handle_dns_query(uint8_t *packet, size_t len, struct sockaddr_in *cl
         (void)w;
         // Optimization: Let the PTY produce some output immediately
         if (sess->pending_len <= sess->pending_off) {
-            usleep(15000); // Increased to 15ms to snag more output locally in a single burst
+            usleep(2000); // reduced to 2ms to prevent huge stall on every typed char
             ssize_t n = read(sess->pty_fd, sess->pending_out, sizeof(sess->pending_out));
             if (n > 0) {
                 sess->pending_len = n;
