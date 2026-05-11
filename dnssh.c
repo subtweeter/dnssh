@@ -46,6 +46,9 @@
 #define RESOLVER_SWITCH_BASE_SEC 12
 #define RESOLVER_SWITCH_MAX_SEC 60
 #define CONNECT_TIMEOUT_SEC 75
+#define RESOLVER_SCAN_ATTEMPTS 2
+#define RESOLVER_SCAN_TIMEOUT_FAST_MS 650
+#define RESOLVER_SCAN_TIMEOUT_SLOW_MS 2200
 
 static char g_domain[256];
 static uint16_t g_server_port = 53;
@@ -292,6 +295,273 @@ static int parse_resolver_arg(const char *arg, struct sockaddr_in *out_addr) {
     if (inet_pton(AF_INET, ipbuf, &out_addr->sin_addr) != 1) return -1;
     out_addr->sin_port = htons(port);
     return 0;
+}
+
+typedef struct {
+    struct sockaddr_in addr;
+    long best_rtt_ms;
+    int valid;
+} resolver_scan_result_t;
+
+static int resolver_addr_equal(const struct sockaddr_in *a, const struct sockaddr_in *b) {
+    if (!a || !b) return 0;
+    return a->sin_family == b->sin_family &&
+           a->sin_port == b->sin_port &&
+           a->sin_addr.s_addr == b->sin_addr.s_addr;
+}
+
+static long timeval_diff_ms(const struct timeval *start, const struct timeval *end) {
+    long sec;
+    long usec;
+
+    if (!start || !end) return 0;
+    sec = (long)(end->tv_sec - start->tv_sec);
+    usec = (long)(end->tv_usec - start->tv_usec);
+    return sec * 1000L + usec / 1000L;
+}
+
+static void format_resolver_addr(const struct sockaddr_in *addr, char *out, size_t out_len) {
+    char ipbuf[INET_ADDRSTRLEN];
+
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (!addr) {
+        snprintf(out, out_len, "<invalid>");
+        return;
+    }
+
+    if (!inet_ntop(AF_INET, &addr->sin_addr, ipbuf, sizeof(ipbuf))) {
+        snprintf(out, out_len, "<invalid>");
+        return;
+    }
+
+    snprintf(out, out_len, "%s:%u", ipbuf, (unsigned)ntohs(addr->sin_port));
+}
+
+static size_t build_dns_txt_probe_query(const char *qname, uint16_t id, uint8_t *packet, size_t packet_cap) {
+    const char *p;
+    size_t off;
+    uint16_t id_n;
+    uint16_t flags;
+    uint16_t qd;
+    uint16_t zero;
+    uint16_t qtype;
+    uint16_t qclass;
+
+    if (!qname || !*qname || !packet || packet_cap < 20) return 0;
+
+    off = 0;
+    id_n = htons(id);
+    flags = htons(0x0100);
+    qd = htons(1);
+    zero = 0;
+
+    memcpy(packet + off, &id_n, 2); off += 2;
+    memcpy(packet + off, &flags, 2); off += 2;
+    memcpy(packet + off, &qd, 2); off += 2;
+    memcpy(packet + off, &zero, 2); off += 2;
+    memcpy(packet + off, &zero, 2); off += 2;
+    memcpy(packet + off, &zero, 2); off += 2;
+
+    p = qname;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
+
+        if (label_len == 0 || label_len > 63) return 0;
+        if (off + 1 + label_len + 5 > packet_cap) return 0;
+
+        packet[off++] = (uint8_t)label_len;
+        memcpy(packet + off, p, label_len);
+        off += label_len;
+
+        if (!dot) break;
+        p = dot + 1;
+    }
+
+    if (off + 1 + 4 > packet_cap) return 0;
+    packet[off++] = 0;
+
+    qtype = htons(16);
+    qclass = htons(1);
+    memcpy(packet + off, &qtype, 2); off += 2;
+    memcpy(packet + off, &qclass, 2); off += 2;
+
+    return off;
+}
+
+static int resolver_scan_cmp(const void *lhs, const void *rhs) {
+    const resolver_scan_result_t *a = (const resolver_scan_result_t *)lhs;
+    const resolver_scan_result_t *b = (const resolver_scan_result_t *)rhs;
+    uint32_t a_ip;
+    uint32_t b_ip;
+    uint16_t a_port;
+    uint16_t b_port;
+
+    if (a->best_rtt_ms < b->best_rtt_ms) return -1;
+    if (a->best_rtt_ms > b->best_rtt_ms) return 1;
+
+    a_ip = ntohl(a->addr.sin_addr.s_addr);
+    b_ip = ntohl(b->addr.sin_addr.s_addr);
+    if (a_ip < b_ip) return -1;
+    if (a_ip > b_ip) return 1;
+
+    a_port = ntohs(a->addr.sin_port);
+    b_port = ntohs(b->addr.sin_port);
+    if (a_port < b_port) return -1;
+    if (a_port > b_port) return 1;
+    return 0;
+}
+
+static int scan_and_sort_resolvers(const struct sockaddr_in *input,
+                                   int input_count,
+                                   struct sockaddr_in *out_sorted,
+                                   int out_cap) {
+    resolver_scan_result_t results[MAX_RESOLVERS];
+    uint16_t tx_ids[MAX_RESOLVERS];
+    struct timeval sent_at[MAX_RESOLVERS];
+    int awaiting[MAX_RESOLVERS];
+    int unresolved;
+    int scan_sock;
+    char probe_name[320];
+
+    if (!input || !out_sorted || input_count <= 0 || out_cap <= 0) return 0;
+    if (input_count > MAX_RESOLVERS) input_count = MAX_RESOLVERS;
+
+    memset(results, 0, sizeof(results));
+    memset(tx_ids, 0, sizeof(tx_ids));
+    memset(sent_at, 0, sizeof(sent_at));
+    memset(awaiting, 0, sizeof(awaiting));
+
+    for (int i = 0; i < input_count; i++) {
+        results[i].addr = input[i];
+        results[i].best_rtt_ms = 0;
+        results[i].valid = 0;
+    }
+
+    if (snprintf(probe_name, sizeof(probe_name), "scan-%08x.%s", (unsigned)randombytes_random(), g_domain) >= (int)sizeof(probe_name)) {
+        return 0;
+    }
+
+    scan_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (scan_sock < 0) return 0;
+    fcntl(scan_sock, F_SETFL, O_NONBLOCK);
+
+    unresolved = input_count;
+    for (int attempt = 0; attempt < RESOLVER_SCAN_ATTEMPTS && unresolved > 0; attempt++) {
+        long stage_timeout_ms = (attempt == 0) ? RESOLVER_SCAN_TIMEOUT_FAST_MS : RESOLVER_SCAN_TIMEOUT_SLOW_MS;
+        struct timeval stage_start;
+        int sent_any = 0;
+
+        for (int i = 0; i < input_count; i++) {
+            uint8_t query[512];
+            size_t qlen;
+
+            if (results[i].valid) continue;
+
+            tx_ids[i] = (uint16_t)randombytes_random();
+            qlen = build_dns_txt_probe_query(probe_name, tx_ids[i], query, sizeof(query));
+            if (qlen == 0) continue;
+
+            gettimeofday(&sent_at[i], NULL);
+            awaiting[i] = 1;
+            sent_any = 1;
+            sendto(scan_sock, query, qlen, 0,
+                   (const struct sockaddr *)&results[i].addr, sizeof(results[i].addr));
+        }
+
+        if (!sent_any) break;
+        gettimeofday(&stage_start, NULL);
+
+        while (unresolved > 0) {
+            struct timeval now;
+            long elapsed_ms;
+            long remaining_ms;
+            struct timeval tv;
+            fd_set rfds;
+            int sel;
+
+            gettimeofday(&now, NULL);
+            elapsed_ms = timeval_diff_ms(&stage_start, &now);
+            remaining_ms = stage_timeout_ms - elapsed_ms;
+            if (remaining_ms <= 0) break;
+
+            tv.tv_sec = remaining_ms / 1000L;
+            tv.tv_usec = (remaining_ms % 1000L) * 1000L;
+            FD_ZERO(&rfds);
+            FD_SET(scan_sock, &rfds);
+
+            sel = select(scan_sock + 1, &rfds, NULL, NULL, &tv);
+            if (sel < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (sel == 0 || !FD_ISSET(scan_sock, &rfds)) continue;
+
+            for (;;) {
+                uint8_t resp[1024];
+                struct sockaddr_in from;
+                socklen_t from_len = sizeof(from);
+                ssize_t rn = recvfrom(scan_sock, resp, sizeof(resp), 0,
+                                      (struct sockaddr *)&from, &from_len);
+                if (rn < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    break;
+                }
+                if (rn < 12) continue;
+
+                uint16_t resp_id;
+                uint16_t resp_flags;
+                memcpy(&resp_id, resp, 2);
+                memcpy(&resp_flags, resp + 2, 2);
+                resp_id = ntohs(resp_id);
+                resp_flags = ntohs(resp_flags);
+                if (!(resp_flags & 0x8000)) continue;
+
+                for (int i = 0; i < input_count; i++) {
+                    long rtt_ms;
+
+                    if (results[i].valid || !awaiting[i]) continue;
+                    if (!resolver_addr_equal(&from, &results[i].addr)) continue;
+                    if (resp_id != tx_ids[i]) continue;
+
+                    gettimeofday(&now, NULL);
+                    rtt_ms = timeval_diff_ms(&sent_at[i], &now);
+                    if (rtt_ms < 0) rtt_ms = 0;
+
+                    results[i].valid = 1;
+                    results[i].best_rtt_ms = rtt_ms;
+                    awaiting[i] = 0;
+                    unresolved--;
+                    break;
+                }
+            }
+        }
+
+        for (int i = 0; i < input_count; i++) {
+            awaiting[i] = 0;
+        }
+    }
+
+    close(scan_sock);
+
+    {
+        resolver_scan_result_t valid[MAX_RESOLVERS];
+        int valid_count = 0;
+
+        for (int i = 0; i < input_count; i++) {
+            if (!results[i].valid) continue;
+            valid[valid_count++] = results[i];
+        }
+
+        qsort(valid, valid_count, sizeof(valid[0]), resolver_scan_cmp);
+
+        if (valid_count > out_cap) valid_count = out_cap;
+        for (int i = 0; i < valid_count; i++) {
+            out_sorted[i] = valid[i].addr;
+        }
+        return valid_count;
+    }
 }
 
     static void hex_encode_bytes(const uint8_t *in, size_t in_len, char *out) {
@@ -596,14 +866,51 @@ int main_client(int argc, char **argv) {
         return 1;
     }
 
+    struct sockaddr_in input_resolvers[MAX_RESOLVERS];
     struct sockaddr_in resolvers[MAX_RESOLVERS];
-    int num_res = argc - 3;
-    if (num_res > MAX_RESOLVERS) num_res = MAX_RESOLVERS;
+    int arg_resolvers = argc - 3;
+    int num_res = 0;
+    if (arg_resolvers > MAX_RESOLVERS) arg_resolvers = MAX_RESOLVERS;
 
-    for (int i = 0; i < num_res; i++) {
-        if (parse_resolver_arg(argv[i + 3], &resolvers[i]) != 0) {
+    for (int i = 0; i < arg_resolvers; i++) {
+        struct sockaddr_in parsed;
+        int is_duplicate = 0;
+
+        if (parse_resolver_arg(argv[i + 3], &parsed) != 0) {
             fprintf(stderr, "Invalid resolver (expected ip or ip:port): %s\n", argv[i + 3]);
             return 1;
+        }
+
+        for (int j = 0; j < num_res; j++) {
+            if (resolver_addr_equal(&input_resolvers[j], &parsed)) {
+                is_duplicate = 1;
+                break;
+            }
+        }
+        if (is_duplicate) continue;
+
+        input_resolvers[num_res++] = parsed;
+    }
+
+    if (num_res <= 0) {
+        fprintf(stderr, "No usable resolver addresses provided.\n");
+        return 1;
+    }
+
+    printf("[DNSSH] Scanning %d resolver(s) for reachability...\n", num_res);
+    {
+        int valid_count = scan_and_sort_resolvers(input_resolvers, num_res, resolvers, MAX_RESOLVERS);
+        if (valid_count > 0) {
+            num_res = valid_count;
+            printf("[DNSSH] Using %d validated resolver(s), sorted by RTT.\n", num_res);
+            for (int i = 0; i < num_res; i++) {
+                char resolver_text[64];
+                format_resolver_addr(&resolvers[i], resolver_text, sizeof(resolver_text));
+                printf("[DNSSH]   %d) %s\n", i + 1, resolver_text);
+            }
+        } else {
+            memcpy(resolvers, input_resolvers, (size_t)num_res * sizeof(input_resolvers[0]));
+            printf("[DNSSH] Resolver scan found no responses; using provided resolver order as fallback.\n");
         }
     }
 
@@ -959,7 +1266,11 @@ int main_client(int argc, char **argv) {
                 elapsed_since_switch >= current_switch_after_sec) {
                 current_res = (current_res + 1) % num_res;
                 last_resolver_switch = now;
-                printf("[DNSSH] Switched resolver -> %s\r\n", inet_ntoa(resolvers[current_res].sin_addr));
+                {
+                    char resolver_text[64];
+                    format_resolver_addr(&resolvers[current_res], resolver_text, sizeof(resolver_text));
+                    printf("[DNSSH] Switched resolver -> %s\r\n", resolver_text);
+                }
                 current_switch_after_sec *= 2;
                 if (current_switch_after_sec > RESOLVER_SWITCH_MAX_SEC) {
                     current_switch_after_sec = RESOLVER_SWITCH_MAX_SEC;
