@@ -40,6 +40,8 @@
 #define IO_CHUNK 64
 #define MAX_PENDING_OUT 32768
 #define DNSSH_PROMPT "\x1b[32mdnssh$ \x1b[0m"
+#define RESOLVER_SWITCH_SEC 5
+#define CONNECT_TIMEOUT_SEC 20
 
 static char g_domain[256];
 static uint16_t g_server_port = 53;
@@ -652,7 +654,8 @@ int main_client(int argc, char **argv) {
     int has_tty = (tcgetattr(STDIN_FILENO, &old_tio) == 0);
     
     int is_connected = 0;
-    int failures = 0;
+    struct timeval last_response;
+    gettimeofday(&last_response, NULL);
     
     while (1) {
         fd_set fds;
@@ -709,7 +712,7 @@ int main_client(int argc, char **argv) {
             uint8_t payload[MAX_PAYLOAD * 4];
             size_t plen = 0;
             if (parse_dns_response(buf, r, payload, sizeof(payload), &plen) == 0) {
-                failures = 0; // Reset failures on valid server response
+                gettimeofday(&last_response, NULL);
                 if (plen == 4 && memcmp(payload, "\xff\xff\xff\xff", 4) == 0) {
                     const char *msg = "\r\n[DNSSH] Remote session closed.\r\n";
                     ssize_t mw = write(STDOUT_FILENO, msg, strlen(msg));
@@ -748,7 +751,6 @@ int main_client(int argc, char **argv) {
                     cw = write(STDOUT_FILENO, build_msg, strlen(build_msg));
                     (void)cw;
 
-                    failures = 0; // reset failures on success
                 }
 
                 ssize_t w = write(STDOUT_FILENO, payload, plen);
@@ -802,7 +804,6 @@ int main_client(int argc, char **argv) {
                     sendto(sock, query, qlen, 0,
                            (struct sockaddr*)&resolvers[current_res], sizeof(resolvers[0]));
                     last_pull = now;
-                    failures++; // Increment failure count here if no response arrives
                 }
             }
         }
@@ -821,13 +822,22 @@ int main_client(int argc, char **argv) {
         }
 
         // resolver rotation on timeout (simple round-robin + backoff)
-        if (failures > 5 && !is_connected) {
-            printf("\r\n[DNSSH] Timed out waiting for server. Aborting connection.\r\n");
-            break;
-        } else if (failures > 3) {
-            current_res = (current_res + 1) % num_res;
-            failures = 0;
-            printf("[DNSSH] Switched resolver → %s\r\n", inet_ntoa(resolvers[current_res].sin_addr));
+        if (waiting_for_command_output || !is_connected) {
+            struct timeval now;
+            long elapsed_sec;
+            gettimeofday(&now, NULL);
+            elapsed_sec = (long)(now.tv_sec - last_response.tv_sec);
+
+            if (!is_connected && elapsed_sec >= CONNECT_TIMEOUT_SEC) {
+                printf("\r\n[DNSSH] Timed out waiting for server. Aborting connection.\r\n");
+                break;
+            }
+
+            if (num_res > 1 && elapsed_sec >= RESOLVER_SWITCH_SEC) {
+                current_res = (current_res + 1) % num_res;
+                last_response = now;
+                printf("[DNSSH] Switched resolver → %s\r\n", inet_ntoa(resolvers[current_res].sin_addr));
+            }
         }
     }
 
