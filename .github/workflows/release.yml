@@ -13,8 +13,6 @@ jobs:
   build_native:
     name: Build natively for x86_64
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,19 +31,19 @@ jobs:
           mv build/dnssh-server dnssh-server-x86_64
 
       - name: Upload dnssh artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dnssh-x86_64
           path: dnssh-x86_64
 
       - name: Upload dnssh-server artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dnssh-server-x86_64
           path: dnssh-server-x86_64
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
           name: Latest Main Build
@@ -57,8 +55,6 @@ jobs:
   build:
     name: Build for ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     strategy:
       fail-fast: false
       matrix:
@@ -95,19 +91,19 @@ jobs:
             mv build/dnssh-server dnssh-server-${{ matrix.arch }}
 
       - name: Upload dnssh artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dnssh-${{ matrix.arch }}
           path: dnssh-${{ matrix.arch }}
 
       - name: Upload dnssh-server artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dnssh-server-${{ matrix.arch }}
           path: dnssh-server-${{ matrix.arch }}
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
           name: Latest Main Build
