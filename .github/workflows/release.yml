@@ -10,23 +10,65 @@ permissions:
   contents: write
 
 jobs:
+  build_native:
+    name: Build natively for x86_64
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libsodium-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          make clean
+          make CC=gcc COMMIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo ${{ github.sha }} | cut -c1-7)
+          mv build/dnssh dnssh-x86_64
+          mv build/dnssh-server dnssh-server-x86_64
+
+      - name: Upload dnssh artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnssh-x86_64
+          path: dnssh-x86_64
+
+      - name: Upload dnssh-server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnssh-server-x86_64
+          path: dnssh-server-x86_64
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Main Build
+          prerelease: true
+          files: |
+            dnssh-x86_64
+            dnssh-server-x86_64
+
   build:
     name: Build for ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            docker_arch: amd64
           - arch: aarch64
             docker_arch: aarch64
           - arch: armv7
             docker_arch: armv7
           - arch: armv6
             docker_arch: armv6
-          - arch: i386
-            docker_arch: i386
           - arch: s390x
             docker_arch: s390x
           - arch: ppc64le
