@@ -79,6 +79,10 @@ typedef struct {
 #define MAX_SESSIONS 32
 static dnssh_session_t g_sessions[MAX_SESSIONS];
 
+// Forward declarations
+static size_t build_dns_query(const uint8_t *session_id, const uint8_t *payload, size_t pay_len, uint8_t *packet, uint16_t *out_id);
+static int parse_dns_response(const uint8_t *packet, size_t len, uint8_t *out_payload, size_t out_cap, size_t *out_len);
+
 // ====================== SHARED HELPERS ======================
 static uint8_t shared_key[KEY_LEN];   // pre-shared for v0.1 (load from file in prod)
 
@@ -433,58 +437,6 @@ static void format_resolver_addr(const struct sockaddr_in *addr, char *out, size
     snprintf(out, out_len, "%s:%u", ipbuf, (unsigned)ntohs(addr->sin_port));
 }
 
-static size_t build_dns_txt_probe_query(const char *qname, uint16_t id, uint8_t *packet, size_t packet_cap) {
-    const char *p;
-    size_t off;
-    uint16_t id_n;
-    uint16_t flags;
-    uint16_t qd;
-    uint16_t zero;
-    uint16_t qtype;
-    uint16_t qclass;
-
-    if (!qname || !*qname || !packet || packet_cap < 20) return 0;
-
-    off = 0;
-    id_n = htons(id);
-    flags = htons(0x0100);
-    qd = htons(1);
-    zero = 0;
-
-    memcpy(packet + off, &id_n, 2); off += 2;
-    memcpy(packet + off, &flags, 2); off += 2;
-    memcpy(packet + off, &qd, 2); off += 2;
-    memcpy(packet + off, &zero, 2); off += 2;
-    memcpy(packet + off, &zero, 2); off += 2;
-    memcpy(packet + off, &zero, 2); off += 2;
-
-    p = qname;
-    while (*p) {
-        const char *dot = strchr(p, '.');
-        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
-
-        if (label_len == 0 || label_len > 63) return 0;
-        if (off + 1 + label_len + 5 > packet_cap) return 0;
-
-        packet[off++] = (uint8_t)label_len;
-        memcpy(packet + off, p, label_len);
-        off += label_len;
-
-        if (!dot) break;
-        p = dot + 1;
-    }
-
-    if (off + 1 + 4 > packet_cap) return 0;
-    packet[off++] = 0;
-
-    qtype = htons(16);
-    qclass = htons(1);
-    memcpy(packet + off, &qtype, 2); off += 2;
-    memcpy(packet + off, &qclass, 2); off += 2;
-
-    return off;
-}
-
 static int resolver_scan_cmp(const void *lhs, const void *rhs) {
     const resolver_scan_result_t *a = (const resolver_scan_result_t *)lhs;
     const resolver_scan_result_t *b = (const resolver_scan_result_t *)rhs;
@@ -521,7 +473,6 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
     int unresolved;
     int scan_sock = -1;
     int rc = -1;
-    char probe_name[320];
 
     if (!input || !out_sorted || !out_count || input_count <= 0) return -1;
     *out_sorted = NULL;
@@ -539,10 +490,6 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
         results[i].valid = 0;
     }
 
-    if (snprintf(probe_name, sizeof(probe_name), "scan-%08x.%s", (unsigned)randombytes_random(), g_domain) >= (int)sizeof(probe_name)) {
-        goto cleanup;
-    }
-
     scan_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (scan_sock < 0) goto cleanup;
     fcntl(scan_sock, F_SETFL, O_NONBLOCK);
@@ -554,14 +501,20 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
         int sent_any = 0;
 
         for (int i = 0; i < input_count; i++) {
+            uint8_t dummy_payload[1] = {0};
             uint8_t query[512];
             size_t qlen;
+            uint16_t generated_id;
 
             if (results[i].valid) continue;
 
-            tx_ids[i] = (uint16_t)randombytes_random();
-            qlen = build_dns_txt_probe_query(probe_name, tx_ids[i], query, sizeof(query));
+            uint8_t temp_session_id[SESSION_ID_LEN];
+            randombytes_buf(temp_session_id, SESSION_ID_LEN);
+
+            qlen = build_dns_query(temp_session_id, dummy_payload, 0, query, &generated_id);
             if (qlen == 0) continue;
+
+            tx_ids[i] = generated_id;
 
             gettimeofday(&sent_at[i], NULL);
             awaiting[i] = 1;
@@ -612,11 +565,16 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
 
                 uint16_t resp_id;
                 uint16_t resp_flags;
+                uint8_t dummy_out[MAX_PAYLOAD * 4];
+                size_t dummy_out_len = 0;
                 memcpy(&resp_id, resp, 2);
                 memcpy(&resp_flags, resp + 2, 2);
                 resp_id = ntohs(resp_id);
                 resp_flags = ntohs(resp_flags);
                 if (!(resp_flags & 0x8000)) continue;
+                if ((resp_flags & 0x000F) != 0) continue; // NOERROR
+                
+                if (parse_dns_response(resp, rn, dummy_out, sizeof(dummy_out), &dummy_out_len) != 0) continue;
 
                 for (int i = 0; i < input_count; i++) {
                     long rtt_ms;
