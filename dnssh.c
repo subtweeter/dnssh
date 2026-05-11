@@ -327,34 +327,43 @@ static char *trim_line_inplace(char *s) {
     return start;
 }
 
-static int add_resolver_unique(struct sockaddr_in *dst,
+static int add_resolver_unique(struct sockaddr_in **dst,
                                int *inout_count,
-                               int dst_cap,
+                               int *inout_cap,
                                const struct sockaddr_in *candidate) {
-    if (!dst || !inout_count || !candidate || dst_cap <= 0) return -1;
+    struct sockaddr_in *grown;
+    int new_cap;
+
+    if (!dst || !inout_count || !inout_cap || !candidate) return -1;
 
     for (int i = 0; i < *inout_count; i++) {
-        if (resolver_addr_equal(&dst[i], candidate)) {
+        if (resolver_addr_equal(&(*dst)[i], candidate)) {
             return 0;
         }
     }
 
-    if (*inout_count >= dst_cap) return -1;
+    if (*inout_count >= *inout_cap) {
+        new_cap = (*inout_cap > 0) ? (*inout_cap * 2) : 16;
+        grown = realloc(*dst, (size_t)new_cap * sizeof(**dst));
+        if (!grown) return -1;
+        *dst = grown;
+        *inout_cap = new_cap;
+    }
 
-    dst[*inout_count] = *candidate;
+    (*dst)[*inout_count] = *candidate;
     (*inout_count)++;
     return 1;
 }
 
 static int load_resolvers_from_file(const char *path,
-                                    struct sockaddr_in *dst,
+                                    struct sockaddr_in **dst,
                                     int *inout_count,
-                                    int dst_cap) {
+                                    int *inout_cap) {
     FILE *f;
     char line[256];
     int line_no = 0;
 
-    if (!path || !*path || !dst || !inout_count || dst_cap <= 0) return -1;
+    if (!path || !*path || !dst || !inout_count || !inout_cap) return -1;
 
     f = fopen(path, "r");
     if (!f) {
@@ -385,8 +394,10 @@ static int load_resolvers_from_file(const char *path,
             return -1;
         }
 
-        if (add_resolver_unique(dst, inout_count, dst_cap, &parsed) < 0) {
-            break;
+        if (add_resolver_unique(dst, inout_count, inout_cap, &parsed) < 0) {
+            fprintf(stderr, "[DNSSH] Failed to grow resolver list while reading %s\n", path);
+            fclose(f);
+            return -1;
         }
     }
 
@@ -499,23 +510,28 @@ static int resolver_scan_cmp(const void *lhs, const void *rhs) {
 
 static int scan_and_sort_resolvers(const struct sockaddr_in *input,
                                    int input_count,
-                                   struct sockaddr_in *out_sorted,
-                                   int out_cap) {
-    resolver_scan_result_t results[MAX_RESOLVERS];
-    uint16_t tx_ids[MAX_RESOLVERS];
-    struct timeval sent_at[MAX_RESOLVERS];
-    int awaiting[MAX_RESOLVERS];
+                                   struct sockaddr_in **out_sorted,
+                                   int *out_count) {
+    resolver_scan_result_t *results = NULL;
+    uint16_t *tx_ids = NULL;
+    struct timeval *sent_at = NULL;
+    int *awaiting = NULL;
+    resolver_scan_result_t *valid = NULL;
+    struct sockaddr_in *sorted = NULL;
     int unresolved;
-    int scan_sock;
+    int scan_sock = -1;
+    int rc = -1;
     char probe_name[320];
 
-    if (!input || !out_sorted || input_count <= 0 || out_cap <= 0) return 0;
-    if (input_count > MAX_RESOLVERS) input_count = MAX_RESOLVERS;
+    if (!input || !out_sorted || !out_count || input_count <= 0) return -1;
+    *out_sorted = NULL;
+    *out_count = 0;
 
-    memset(results, 0, sizeof(results));
-    memset(tx_ids, 0, sizeof(tx_ids));
-    memset(sent_at, 0, sizeof(sent_at));
-    memset(awaiting, 0, sizeof(awaiting));
+    results = calloc((size_t)input_count, sizeof(*results));
+    tx_ids = calloc((size_t)input_count, sizeof(*tx_ids));
+    sent_at = calloc((size_t)input_count, sizeof(*sent_at));
+    awaiting = calloc((size_t)input_count, sizeof(*awaiting));
+    if (!results || !tx_ids || !sent_at || !awaiting) goto cleanup;
 
     for (int i = 0; i < input_count; i++) {
         results[i].addr = input[i];
@@ -524,11 +540,11 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
     }
 
     if (snprintf(probe_name, sizeof(probe_name), "scan-%08x.%s", (unsigned)randombytes_random(), g_domain) >= (int)sizeof(probe_name)) {
-        return 0;
+        goto cleanup;
     }
 
     scan_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (scan_sock < 0) return 0;
+    if (scan_sock < 0) goto cleanup;
     fcntl(scan_sock, F_SETFL, O_NONBLOCK);
 
     unresolved = input_count;
@@ -627,10 +643,10 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
         }
     }
 
-    close(scan_sock);
+    valid = malloc((size_t)input_count * sizeof(*valid));
+    if (!valid) goto cleanup;
 
     {
-        resolver_scan_result_t valid[MAX_RESOLVERS];
         int valid_count = 0;
 
         for (int i = 0; i < input_count; i++) {
@@ -638,14 +654,36 @@ static int scan_and_sort_resolvers(const struct sockaddr_in *input,
             valid[valid_count++] = results[i];
         }
 
-        qsort(valid, valid_count, sizeof(valid[0]), resolver_scan_cmp);
-
-        if (valid_count > out_cap) valid_count = out_cap;
-        for (int i = 0; i < valid_count; i++) {
-            out_sorted[i] = valid[i].addr;
+        if (valid_count <= 0) {
+            rc = 0;
+            goto cleanup;
         }
-        return valid_count;
+
+        qsort(valid, (size_t)valid_count, sizeof(valid[0]), resolver_scan_cmp);
+
+        sorted = malloc((size_t)valid_count * sizeof(*sorted));
+        if (!sorted) goto cleanup;
+
+        for (int i = 0; i < valid_count; i++) {
+            sorted[i] = valid[i].addr;
+        }
+
+        *out_sorted = sorted;
+        *out_count = valid_count;
+        sorted = NULL;
     }
+
+    rc = 0;
+
+cleanup:
+    if (scan_sock >= 0) close(scan_sock);
+    free(results);
+    free(tx_ids);
+    free(sent_at);
+    free(awaiting);
+    free(valid);
+    free(sorted);
+    return rc;
 }
 
 static int resolver_fanout_count(int num_resolvers) {
@@ -1001,9 +1039,10 @@ int main_client(int argc, char **argv) {
         return 1;
     }
 
-    struct sockaddr_in input_resolvers[MAX_RESOLVERS];
-    struct sockaddr_in resolvers[MAX_RESOLVERS];
+    struct sockaddr_in *input_resolvers = NULL;
+    struct sockaddr_in *resolvers = NULL;
     int arg_resolvers = argc - 3;
+    int input_cap = 0;
     int num_res = 0;
 
     for (int i = 0; i < arg_resolvers; i++) {
@@ -1011,11 +1050,10 @@ int main_client(int argc, char **argv) {
         const char *file_path = arg;
         int should_load_file = 0;
 
-        if (num_res >= MAX_RESOLVERS) break;
-
         if (arg[0] == '@') {
             if (arg[1] == '\0') {
                 fprintf(stderr, "Invalid resolver file argument: @\n");
+                free(input_resolvers);
                 return 1;
             }
             should_load_file = 1;
@@ -1024,7 +1062,8 @@ int main_client(int argc, char **argv) {
 
         if (should_load_file) {
             int before = num_res;
-            if (load_resolvers_from_file(file_path, input_resolvers, &num_res, MAX_RESOLVERS) != 0) {
+            if (load_resolvers_from_file(file_path, &input_resolvers, &num_res, &input_cap) != 0) {
+                free(input_resolvers);
                 return 1;
             }
             printf("[DNSSH] Loaded %d resolver(s) from file: %s\n", num_res - before, file_path);
@@ -1034,30 +1073,49 @@ int main_client(int argc, char **argv) {
         struct sockaddr_in parsed;
         if (parse_resolver_arg(arg, &parsed) != 0) {
             fprintf(stderr, "Invalid resolver (expected ip, ip:port, or @file): %s\n", arg);
+            free(input_resolvers);
             return 1;
         }
-        (void)add_resolver_unique(input_resolvers, &num_res, MAX_RESOLVERS, &parsed);
+        if (add_resolver_unique(&input_resolvers, &num_res, &input_cap, &parsed) < 0) {
+            fprintf(stderr, "Failed to grow resolver list (out of memory).\n");
+            free(input_resolvers);
+            return 1;
+        }
     }
 
     if (num_res <= 0) {
         fprintf(stderr, "No usable resolver addresses provided.\n");
+        free(input_resolvers);
         return 1;
     }
 
     printf("[DNSSH] Scanning %d resolver(s) for reachability...\n", num_res);
     {
-        int valid_count = scan_and_sort_resolvers(input_resolvers, num_res, resolvers, MAX_RESOLVERS);
-        if (valid_count > 0) {
-            num_res = valid_count;
-            printf("[DNSSH] Using %d validated resolver(s), sorted by RTT.\n", num_res);
-            for (int i = 0; i < num_res; i++) {
-                char resolver_text[64];
-                format_resolver_addr(&resolvers[i], resolver_text, sizeof(resolver_text));
-                printf("[DNSSH]   %d) %s\n", i + 1, resolver_text);
-            }
-        } else {
-            memcpy(resolvers, input_resolvers, (size_t)num_res * sizeof(input_resolvers[0]));
-            printf("[DNSSH] Resolver scan found no responses; using provided resolver order as fallback.\n");
+        struct sockaddr_in *validated = NULL;
+        int validated_count = 0;
+
+        if (scan_and_sort_resolvers(input_resolvers, num_res, &validated, &validated_count) != 0) {
+            fprintf(stderr, "[DNSSH] Resolver scan failed due to internal error.\n");
+            free(input_resolvers);
+            return 1;
+        }
+
+        free(input_resolvers);
+        input_resolvers = NULL;
+
+        if (validated_count <= 0) {
+            fprintf(stderr, "[DNSSH] No validated resolvers responded. Aborting connection.\n");
+            free(validated);
+            return 1;
+        }
+
+        resolvers = validated;
+        num_res = validated_count;
+        printf("[DNSSH] Using %d validated resolver(s), sorted by RTT.\n", num_res);
+        for (int i = 0; i < num_res; i++) {
+            char resolver_text[64];
+            format_resolver_addr(&resolvers[i], resolver_text, sizeof(resolver_text));
+            printf("[DNSSH]   %d) %s\n", i + 1, resolver_text);
         }
     }
 
@@ -1446,6 +1504,8 @@ int main_client(int argc, char **argv) {
     if (has_tty) {
         tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
     }
+
+    free(resolvers);
 
     return 0;
 }
